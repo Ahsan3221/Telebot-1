@@ -59,9 +59,6 @@ logger = logging.getLogger(__name__)
 
 # ============================================================
 # DATABASE — PostgreSQL
-# Ephemeral filesystem problem solve:
-# SQLite se PostgreSQL migrate kiya
-# Data redeploy ke baad bhi safe rahega
 # ============================================================
 
 _conn = None
@@ -246,7 +243,7 @@ def db_get_all_users():
 
 
 # ============================================================
-# PER-USER LOCKS — race condition fix
+# PER-USER LOCKS
 # ============================================================
 
 TOPIC_CREATION_LOCKS: dict[int, asyncio.Lock] = {}
@@ -340,6 +337,75 @@ def _is_closed_topic_error(error: TelegramError) -> bool:
 
 
 # ============================================================
+# SEND TO GROUP — with closed topic retry
+# Helper function jo har jagah reuse hoga
+# ============================================================
+
+async def _send_to_group(
+    user,
+    context: ContextTypes.DEFAULT_TYPE,
+    topic_id: int,
+    text: str,
+) -> int:
+    """
+    Group topic mein message bhejo.
+    Agar topic closed hai to recreate karo.
+    Returns: working topic_id
+    """
+
+    try:
+
+        await context.bot.send_message(
+            chat_id=SUPPORT_GROUP_ID,
+            message_thread_id=topic_id,
+            text=text
+        )
+
+        return topic_id
+
+    except TelegramError as e:
+
+        if _is_closed_topic_error(e):
+
+            logger.warning(
+                "Topic %s closed — recreating for user %s",
+                topic_id,
+                user.id
+            )
+
+            new_topic_id = await _clear_topic_and_recreate(
+                user,
+                topic_id,
+                context
+            )
+
+            if new_topic_id:
+
+                try:
+
+                    await context.bot.send_message(
+                        chat_id=SUPPORT_GROUP_ID,
+                        message_thread_id=new_topic_id,
+                        text=text
+                    )
+
+                    return new_topic_id
+
+                except TelegramError as e2:
+
+                    logger.error(
+                        "Send failed after recreate: %s",
+                        e2
+                    )
+
+        else:
+
+            logger.error("Send to group failed: %s", e)
+
+    return topic_id
+
+
+# ============================================================
 # TOPIC CREATION
 # ============================================================
 
@@ -404,7 +470,7 @@ async def _create_new_topic(
         db_add_topic_mapping(topic_id, user.id)
 
         game_line = (
-            f"🎮 Game     : {existing_game} (auto-selected)"
+            f"🎮 Game     : {existing_game}"
             if existing_game
             else "🎮 Game     : Not selected yet"
         )
@@ -556,7 +622,7 @@ async def _forward_customer_message(
 
 
 # ============================================================
-# START
+# START — group mein notify + deep-link game select
 # ============================================================
 
 async def start(
@@ -587,6 +653,34 @@ async def start(
 
     if pre_selected_game:
 
+        # Deep-link — game auto-select
+        db_upsert_user(
+            user_id=user.id,
+            name=user.full_name or user.first_name or "Unknown",
+            username=user.username or "",
+            topic_id=topic_id,
+            game=pre_selected_game,
+        )
+
+        db_add_topic_mapping(topic_id, user.id)
+
+        # Group mein deep-link entry notify
+        topic_id = await _send_to_group(
+            user,
+            context,
+            topic_id,
+            text=(
+                "🔗 DEEP-LINK ENTRY\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"👤 Name     : {user.full_name or user.first_name or 'Unknown'}\n"
+                f"🔗 Username : @{user.username or 'No username'}\n"
+                f"🆔 ID       : {user.id}\n"
+                f"🎮 Game     : {pre_selected_game}\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━"
+            )
+        )
+
+        # Customer ko confirm
         await update.message.reply_text(
             f"👋 Welcome to WishWheel Support!\n\n"
             f"🎮 Game selected: {pre_selected_game}\n\n"
@@ -596,6 +690,23 @@ async def start(
 
     else:
 
+        # Normal /start — group mein notify
+        topic_id = await _send_to_group(
+            user,
+            context,
+            topic_id,
+            text=(
+                "🆕 CUSTOMER STARTED BOT\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"👤 Name     : {user.full_name or user.first_name or 'Unknown'}\n"
+                f"🔗 Username : @{user.username or 'No username'}\n"
+                f"🆔 ID       : {user.id}\n"
+                f"🎮 Game     : Not selected yet\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━"
+            )
+        )
+
+        # Customer ko welcome + game buttons
         await update.message.reply_text(
             "👋 Welcome to WishWheel Support!\n\n"
             "🎮 Select your game below (optional).\n\n"
@@ -694,59 +805,13 @@ async def game_selected(
 
     db_add_topic_mapping(topic_id, user.id)
 
-    try:
-
-        await context.bot.send_message(
-            chat_id=SUPPORT_GROUP_ID,
-            message_thread_id=topic_id,
-            text=f"🎮 GAME SELECTED: {game}"
-        )
-
-    except TelegramError as e:
-
-        if _is_closed_topic_error(e):
-
-            logger.warning(
-                "Game selection — closed topic %s, recreating",
-                topic_id
-            )
-
-            new_topic_id = await _clear_topic_and_recreate(
-                user,
-                topic_id,
-                context
-            )
-
-            if new_topic_id:
-
-                db_upsert_user(
-                    user_id=user.id,
-                    name=user.full_name or user.first_name or "Unknown",
-                    username=user.username or "",
-                    topic_id=new_topic_id,
-                    game=game,
-                )
-
-                db_add_topic_mapping(new_topic_id, user.id)
-
-                try:
-
-                    await context.bot.send_message(
-                        chat_id=SUPPORT_GROUP_ID,
-                        message_thread_id=new_topic_id,
-                        text=f"🎮 GAME SELECTED: {game}"
-                    )
-
-                except TelegramError as e2:
-
-                    logger.error(
-                        "Game notify failed after recreate: %s",
-                        e2
-                    )
-
-        else:
-
-            logger.error("Game notify failed: %s", e)
+    # Group mein game selected notify
+    await _send_to_group(
+        user,
+        context,
+        topic_id,
+        text=f"🎮 GAME SELECTED: {game}"
+    )
 
     await query.message.reply_text(
         f"✅ {game} selected!\n\n"
@@ -792,7 +857,6 @@ async def customer_message(
         selected_game=selected_game,
     )
 
-    # Success pe kuch nahi — seamless chat feel
     if not success:
 
         await update.message.reply_text(
