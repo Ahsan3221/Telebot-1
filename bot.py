@@ -7,7 +7,7 @@ from psycopg2 import pool as pg_pool
 from psycopg2.extras import RealDictCursor
 
 from datetime import datetime, timezone
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from telegram.error import TelegramError
 from telegram.ext import (
     Application,
@@ -52,8 +52,10 @@ GAMES = [
 # ============================================================
 # TRAFFIC SOURCES
 # Deep-link parameter → readable label mapping
-# t.me/YourBot?start=website   → "🌐 Website"
-# t.me/YourBot?start=facebook  → "📘 Facebook"
+# t.me/YourBot?start=website        → "🌐 Website"
+# t.me/YourBot?start=facebook       → "📘 Facebook"
+# t.me/YourBot?start=src_website    → "🌐 Website"   (safe/explicit form)
+# t.me/YourBot?start=src_facebook   → "📘 Facebook"  (safe/explicit form)
 # ============================================================
 
 TRAFFIC_SOURCES = {
@@ -108,12 +110,18 @@ async def _queue_worker(user_id: int, context: ContextTypes.DEFAULT_TYPE):
             except asyncio.TimeoutError:
                 break
 
-            success = await _forward_customer_message(
-                user=user,
-                update=update,
-                context=context,
-                topic_id=topic_id,
-            )
+            try:
+                success = await _forward_customer_message(
+                    user=user,
+                    update=update,
+                    context=context,
+                    topic_id=topic_id,
+                )
+            except Exception:
+                logger.exception(
+                    "Unexpected error forwarding message for user %s", user_id
+                )
+                success = False
 
             if not success:
                 try:
@@ -251,7 +259,6 @@ def init_db():
             ADD COLUMN IF NOT EXISTS topic_status TEXT NOT NULL DEFAULT 'open';
         """)
 
-        # NEW: source aur bonus columns add karo
         cur.execute("""
             ALTER TABLE users
             ADD COLUMN IF NOT EXISTS source TEXT;
@@ -450,7 +457,7 @@ def games_keyboard():
 
 def bonus_keyboard():
     """
-    NEW: Start ke baad customer ko dikhne wale 2 bonus buttons.
+    Start ke baad customer ko dikhne wale 2 bonus buttons.
     """
 
     buttons = [
@@ -516,15 +523,21 @@ def _parse_deeplink_game(args: list[str]) -> str | None:
 
 def _parse_deeplink_source(args: list[str]) -> str | None:
     """
-    NEW: Deep-link se traffic source detect karo.
-    Sirf tab return karega jab source valid TRAFFIC_SOURCES mein ho.
-    Ye games se alag hai — check karo ke param source hai ya game.
+    Deep-link se traffic source detect karo.
+
+    Backward compatible:  ?start=website        / ?start=facebook
+    Safe explicit form:   ?start=src_website     / ?start=src_facebook
+    (the src_ prefix avoids any future clash with game-name deep links)
     """
 
     if not args:
         return None
 
     param = args[0].lower().strip()
+
+    if param.startswith("src_"):
+        key = param[4:]
+        return TRAFFIC_SOURCES.get(key)
 
     if param in TRAFFIC_SOURCES:
         return TRAFFIC_SOURCES[param]
@@ -576,6 +589,18 @@ async def get_or_create_topic(
             else:
                 topic_id = row["topic_id"]
 
+            # Existing customer: still persist any new deep-link info
+            # (game/source) that arrived on this visit — this was previously
+            # silently dropped for returning customers.
+            if topic_id and (pre_selected_game or source):
+                await db_upsert_user(
+                    user_id=user_id,
+                    name=user.full_name or user.first_name or "Unknown",
+                    username=user.username or "",
+                    game=pre_selected_game,
+                    source=source,
+                )
+
         else:
             topic_id = await _create_new_topic(
                 user,
@@ -595,7 +620,7 @@ async def _create_new_topic(
     source: str | None = None,
 ) -> int | None:
     """
-    UPDATED: Source ab welcome message mein include hota hai
+    Source ab welcome message mein include hota hai
     aur database mein save hota hai.
     """
 
@@ -643,7 +668,6 @@ async def _create_new_topic(
             else "🎮 Game     : Not selected yet"
         )
 
-        # NEW: Source line
         source_line = (
             f"📊 Source   : {existing_source}"
             if existing_source
@@ -839,9 +863,11 @@ async def _forward_customer_message(
 
 
 # ============================================================
-# START — UPDATED
-# Ab flow: /start → Bonus buttons → Game buttons
-# Source auto-detected from deep-link
+# START — REWORKED
+# User ko HAMESHA turant reply milta hai (Telegram Ads requirement:
+# "bots must respond to commands properly"). Topic creation, DB writes,
+# aur group notify sab background mein (asyncio.create_task) hote hain,
+# taake slow/failed backend user ko blank na chhode.
 # ============================================================
 
 async def start(
@@ -861,87 +887,121 @@ async def start(
     pre_selected_game = _parse_deeplink_game(context.args or [])
     source = _parse_deeplink_source(context.args or [])
 
-    topic_id = await get_or_create_topic(
-        user,
-        context,
-        pre_selected_game=pre_selected_game,
-        source=source,
-    )
-
-    if not topic_id:
-        return
-
-    # Agar deep-link game hai to seedha welcome + game selected
+    # 1) USER REPLY FIRST — no backend/topic work before this.
     if pre_selected_game:
-
-        await db_upsert_user(
-            user_id=user.id,
-            name=user.full_name or user.first_name or "Unknown",
-            username=user.username or "",
-            topic_id=topic_id,
-            game=pre_selected_game,
-            source=source,
-        )
-
-        await db_add_topic_mapping(topic_id, user.id)
-
-        source_line = f"\n📊 Source   : {source}" if source else ""
-
-        await _send_to_group(
-            user,
-            context,
-            topic_id,
-            text=(
-                "🔗 DEEP-LINK ENTRY\n"
-                "━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"👤 Name     : {user.full_name or user.first_name or 'Unknown'}\n"
-                f"🔗 Username : @{user.username or 'No username'}\n"
-                f"🆔 ID       : {user.id}\n"
-                f"🎮 Game     : {pre_selected_game}"
-                f"{source_line}\n"
-                "━━━━━━━━━━━━━━━━━━━━━━━━"
-            )
-        )
-
         await update.message.reply_text(
             f"👋 Welcome to WishWheel Support!\n\n"
             f"🎮 Game selected: {pre_selected_game}\n\n"
             "💬 Send your message — "
             "our team will assist you right away!"
         )
-
-        return
-
-    # Normal /start ya source-only deep-link
-    # Group mein customer connected notify karo
-    source_line = f"\n📊 Source   : {source}" if source else ""
-
-    await _send_to_group(
-        user,
-        context,
-        topic_id,
-        text=(
-            "🆕 CUSTOMER STARTED BOT\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"👤 Name     : {user.full_name or user.first_name or 'Unknown'}\n"
-            f"🔗 Username : @{user.username or 'No username'}\n"
-            f"🆔 ID       : {user.id}"
-            f"{source_line}\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━━"
+    else:
+        await update.message.reply_text(
+            "👋 Welcome to WishWheel Support!\n\n"
+            "🎁 Choose your bonus:",
+            reply_markup=bonus_keyboard()
         )
+
+    # 2) Backend work happens after, fire-and-forget.
+    asyncio.create_task(
+        _finalize_start(user, context, pre_selected_game, source)
     )
 
-    # NEW FLOW: Pehle bonus select karao
+
+async def _finalize_start(
+    user,
+    context: ContextTypes.DEFAULT_TYPE,
+    pre_selected_game: str | None,
+    source: str | None,
+):
+    """
+    Background work for /start: create/reopen topic, persist game/source,
+    and notify the support group. Failures here are logged only — the
+    user has already received their reply and should never see this fail.
+    """
+
+    try:
+
+        existing = await db_get_user(user.id)
+        is_new_customer = not (existing and existing.get("topic_id"))
+
+        topic_id = await get_or_create_topic(
+            user,
+            context,
+            pre_selected_game=pre_selected_game,
+            source=source,
+        )
+
+        if not topic_id:
+            logger.error(
+                "Backend setup failed for user %s after /start "
+                "(user already received a reply).",
+                user.id,
+            )
+            return
+
+        # New customer: _create_new_topic already posted a full
+        # "NEW PLAYER CONNECTED" card — nothing more to send.
+        if is_new_customer:
+            return
+
+        # Returning customer: avoid duplicate "NEW PLAYER"-style noise.
+        # Reopen (if it happened) already posted its own short notice.
+        # Only add a line here if this visit brought new deep-link info.
+        if pre_selected_game or source:
+
+            details = []
+
+            if pre_selected_game:
+                details.append(f"🎮 Game   : {pre_selected_game}")
+
+            if source:
+                details.append(f"📊 Source : {source}")
+
+            await _send_to_group(
+                user,
+                context,
+                topic_id,
+                text=(
+                    "🔁 CUSTOMER RETURNED (deep-link)\n"
+                    + "\n".join(details)
+                )
+            )
+
+    except Exception:
+        logger.exception(
+            "Unhandled error finalizing /start backend work for user %s",
+            user.id,
+        )
+
+
+# ============================================================
+# HELP COMMAND — NEW
+# ============================================================
+
+async def help_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    if not update.message:
+        return
+
     await update.message.reply_text(
-        "👋 Welcome to WishWheel Support!\n\n"
-        "🎁 Choose your bonus:",
-        reply_markup=bonus_keyboard()
+        "ℹ️ WISHWHEEL SUPPORT — HELP\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "/start   — Begin or restart your support chat\n"
+        "/games   — Choose or change your game\n"
+        "/support — Reach our support team\n"
+        "/help    — Show this message\n\n"
+        "💬 You can also just send a message anytime — "
+        "our team will reply right here."
     )
 
 
 # ============================================================
-# BONUS SELECTION — NEW HANDLER
-# Bonus select hone ke baad game buttons show karo
+# BONUS SELECTION
+# User ko pehle confirmation milta hai, phir DB/group backend mein.
 # ============================================================
 
 async def bonus_selected(
@@ -970,34 +1030,57 @@ async def bonus_selected(
 
     bonus_label = BONUS_OPTIONS[bonus_key]
 
-    topic_id = await get_or_create_topic(user, context)
-
-    if not topic_id:
-        return
-
-    # Bonus save karo
-    await db_upsert_user(
-        user_id=user.id,
-        name=user.full_name or user.first_name or "Unknown",
-        username=user.username or "",
-        topic_id=topic_id,
-        bonus=bonus_label,
-    )
-
-    # Group mein notify karo
-    await _send_to_group(
-        user,
-        context,
-        topic_id,
-        text=f"🎁 BONUS SELECTED: {bonus_label}"
-    )
-
-    # Ab game selection show karo
+    # 1) USER REPLY FIRST.
     await query.message.reply_text(
         f"✅ {bonus_label} selected!\n\n"
         "🎮 Now choose your game:",
         reply_markup=games_keyboard()
     )
+
+    # 2) Backend work after.
+    asyncio.create_task(
+        _finalize_bonus_selection(user, context, bonus_label)
+    )
+
+
+async def _finalize_bonus_selection(
+    user,
+    context: ContextTypes.DEFAULT_TYPE,
+    bonus_label: str,
+):
+
+    try:
+
+        topic_id = await get_or_create_topic(user, context)
+
+        if not topic_id:
+            logger.error(
+                "Backend setup failed for user %s after bonus selection "
+                "(user already received a reply).",
+                user.id,
+            )
+            return
+
+        await db_upsert_user(
+            user_id=user.id,
+            name=user.full_name or user.first_name or "Unknown",
+            username=user.username or "",
+            topic_id=topic_id,
+            bonus=bonus_label,
+        )
+
+        await _send_to_group(
+            user,
+            context,
+            topic_id,
+            text=f"🎁 BONUS SELECTED: {bonus_label}"
+        )
+
+    except Exception:
+        logger.exception(
+            "Unhandled error finalizing bonus selection for user %s",
+            user.id,
+        )
 
 
 # ============================================================
@@ -1012,14 +1095,15 @@ async def games(
     if not update.message:
         return
 
-    await get_or_create_topic(
-        update.effective_user,
-        context
-    )
-
+    # 1) USER REPLY FIRST.
     await update.message.reply_text(
         "🎮 Choose your game:",
         reply_markup=games_keyboard()
+    )
+
+    # 2) Ensure a topic exists in the background.
+    asyncio.create_task(
+        _finalize_topic_touch(update.effective_user, context)
     )
 
 
@@ -1035,15 +1119,29 @@ async def support(
     if not update.message:
         return
 
-    await get_or_create_topic(
-        update.effective_user,
-        context
-    )
-
+    # 1) USER REPLY FIRST.
     await update.message.reply_text(
         "💬 Select your game (optional):",
         reply_markup=games_keyboard()
     )
+
+    # 2) Ensure a topic exists in the background.
+    asyncio.create_task(
+        _finalize_topic_touch(update.effective_user, context)
+    )
+
+
+async def _finalize_topic_touch(user, context: ContextTypes.DEFAULT_TYPE):
+
+    if not user:
+        return
+
+    try:
+        await get_or_create_topic(user, context)
+    except Exception:
+        logger.exception(
+            "Unhandled error ensuring topic exists for user %s", user.id
+        )
 
 
 # ============================================================
@@ -1074,32 +1172,58 @@ async def game_selected(
 
         return
 
-    topic_id = await get_or_create_topic(user, context)
-
-    if not topic_id:
-        return
-
-    await db_upsert_user(
-        user_id=user.id,
-        name=user.full_name or user.first_name or "Unknown",
-        username=user.username or "",
-        topic_id=topic_id,
-        game=game,
-    )
-
-    await db_add_topic_mapping(topic_id, user.id)
-
-    await _send_to_group(
-        user,
-        context,
-        topic_id,
-        text=f"🎮 GAME SELECTED: {game}"
-    )
-
+    # 1) USER REPLY FIRST.
     await query.message.reply_text(
         f"✅ {game} selected!\n\n"
         "💬 Send your message — team will reply shortly!"
     )
+
+    # 2) Backend work after.
+    asyncio.create_task(
+        _finalize_game_selection(user, context, game)
+    )
+
+
+async def _finalize_game_selection(
+    user,
+    context: ContextTypes.DEFAULT_TYPE,
+    game: str,
+):
+
+    try:
+
+        topic_id = await get_or_create_topic(user, context)
+
+        if not topic_id:
+            logger.error(
+                "Backend setup failed for user %s after game selection "
+                "(user already received a reply).",
+                user.id,
+            )
+            return
+
+        await db_upsert_user(
+            user_id=user.id,
+            name=user.full_name or user.first_name or "Unknown",
+            username=user.username or "",
+            topic_id=topic_id,
+            game=game,
+        )
+
+        await db_add_topic_mapping(topic_id, user.id)
+
+        await _send_to_group(
+            user,
+            context,
+            topic_id,
+            text=f"🎮 GAME SELECTED: {game}"
+        )
+
+    except Exception:
+        logger.exception(
+            "Unhandled error finalizing game selection for user %s",
+            user.id,
+        )
 
 
 # ============================================================
@@ -1122,6 +1246,16 @@ async def customer_message(
     topic_id = await get_or_create_topic(user, context)
 
     if not topic_id:
+
+        # Never drop the customer's message silently.
+        try:
+            await update.message.reply_text(
+                "⚠️ Support system temporarily unavailable. "
+                "Please try again in a moment."
+            )
+        except Exception:
+            pass
+
         return
 
     await enqueue_customer_message(
@@ -1219,7 +1353,7 @@ async def support_group_message(
 
 
 # ============================================================
-# /stats COMMAND — UPDATED with source breakdown
+# /stats COMMAND — with source breakdown
 # ============================================================
 
 async def stats(
@@ -1266,7 +1400,6 @@ async def stats(
         """)
         game_rows = cur.fetchall()
 
-        # NEW: Source breakdown
         cur.execute("""
             SELECT source, COUNT(*) AS c
             FROM users
@@ -1276,7 +1409,6 @@ async def stats(
         """)
         source_rows = cur.fetchall()
 
-        # NEW: Bonus breakdown
         cur.execute("""
             SELECT bonus, COUNT(*) AS c
             FROM users
@@ -1428,7 +1560,7 @@ async def broadcast(
 
 
 # ============================================================
-# /id COMMAND — UPDATED with source & bonus
+# /id COMMAND — with source & bonus
 # ============================================================
 
 async def customer_info(
@@ -1710,6 +1842,22 @@ async def error_handler(
 
 
 # ============================================================
+# POST-INIT — register bot commands with Telegram
+# ============================================================
+
+async def post_init(application: Application):
+
+    await application.bot.set_my_commands([
+        BotCommand("start", "Start or restart your support chat"),
+        BotCommand("help", "Show help and available commands"),
+        BotCommand("games", "Choose or change your game"),
+        BotCommand("support", "Reach our support team"),
+    ])
+
+    logger.info("Bot commands registered with Telegram.")
+
+
+# ============================================================
 # MAIN
 # ============================================================
 
@@ -1738,10 +1886,12 @@ def main():
     application = (
         Application.builder()
         .token(TOKEN)
+        .post_init(post_init)
         .build()
     )
 
     application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("games", games))
     application.add_handler(CommandHandler("support", support))
 
