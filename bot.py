@@ -89,6 +89,26 @@ WORKER_IDLE_TIMEOUT = 5
 _user_queues: dict[int, asyncio.Queue] = {}
 _user_workers: dict[int, asyncio.Task] = {}
 
+# ============================================================
+# BACKGROUND TASK REGISTRY
+#
+# asyncio only keeps a WEAK reference to tasks created via
+# asyncio.create_task(). If nothing else references the task object,
+# it can be garbage-collected mid-execution — silently killing a
+# "fire and forget" background job (e.g. topic creation / group
+# notify) before it finishes, with no error raised anywhere.
+# This registry keeps a strong reference until each task completes.
+# ============================================================
+
+_background_tasks: set[asyncio.Task] = set()
+
+
+def fire_and_forget(coro) -> asyncio.Task:
+    task = asyncio.create_task(coro)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+    return task
+
 
 def _get_or_create_queue(user_id: int) -> asyncio.Queue:
     if user_id not in _user_queues:
@@ -902,8 +922,9 @@ async def start(
             reply_markup=bonus_keyboard()
         )
 
-    # 2) Backend work happens after, fire-and-forget.
-    asyncio.create_task(
+    # 2) Backend work happens after, fire-and-forget (with a strong
+    #    reference kept so it can't be garbage-collected mid-flight).
+    fire_and_forget(
         _finalize_start(user, context, pre_selected_game, source)
     )
 
@@ -945,28 +966,32 @@ async def _finalize_start(
         if is_new_customer:
             return
 
-        # Returning customer: avoid duplicate "NEW PLAYER"-style noise.
-        # Reopen (if it happened) already posted its own short notice.
-        # Only add a line here if this visit brought new deep-link info.
-        if pre_selected_game or source:
+        # Returning customer: every /start still gets forwarded to the
+        # group, so agents always see the activity — just without
+        # re-posting the full "NEW PLAYER CONNECTED" card each time.
+        details = [
+            f"👤 Name     : {user.full_name or user.first_name or 'Unknown'}",
+            f"🔗 Username : @{user.username or 'No username'}",
+            f"🆔 ID       : {user.id}",
+        ]
 
-            details = []
+        if pre_selected_game:
+            details.append(f"🎮 Game     : {pre_selected_game}")
 
-            if pre_selected_game:
-                details.append(f"🎮 Game   : {pre_selected_game}")
+        if source:
+            details.append(f"📊 Source   : {source}")
 
-            if source:
-                details.append(f"📊 Source : {source}")
-
-            await _send_to_group(
-                user,
-                context,
-                topic_id,
-                text=(
-                    "🔁 CUSTOMER RETURNED (deep-link)\n"
-                    + "\n".join(details)
-                )
+        await _send_to_group(
+            user,
+            context,
+            topic_id,
+            text=(
+                "🔁 CUSTOMER STARTED BOT AGAIN\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                + "\n".join(details) + "\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━"
             )
+        )
 
     except Exception:
         logger.exception(
@@ -1038,7 +1063,7 @@ async def bonus_selected(
     )
 
     # 2) Backend work after.
-    asyncio.create_task(
+    fire_and_forget(
         _finalize_bonus_selection(user, context, bonus_label)
     )
 
@@ -1101,9 +1126,9 @@ async def games(
         reply_markup=games_keyboard()
     )
 
-    # 2) Ensure a topic exists in the background.
-    asyncio.create_task(
-        _finalize_topic_touch(update.effective_user, context)
+    # 2) Ensure a topic exists AND notify the group, in the background.
+    fire_and_forget(
+        _finalize_command_touch(update.effective_user, context, "GAMES")
     )
 
 
@@ -1125,22 +1150,66 @@ async def support(
         reply_markup=games_keyboard()
     )
 
-    # 2) Ensure a topic exists in the background.
-    asyncio.create_task(
-        _finalize_topic_touch(update.effective_user, context)
+    # 2) Ensure a topic exists AND notify the group, in the background.
+    fire_and_forget(
+        _finalize_command_touch(update.effective_user, context, "SUPPORT")
     )
 
 
-async def _finalize_topic_touch(user, context: ContextTypes.DEFAULT_TYPE):
+async def _finalize_command_touch(
+    user,
+    context: ContextTypes.DEFAULT_TYPE,
+    command_label: str,
+):
+    """
+    Background work for /games and /support: ensures a topic exists and
+    makes sure the group always sees that the customer used the command —
+    same rule as /start: new customers get the full "NEW PLAYER CONNECTED"
+    card from topic creation, returning customers get a short notice here
+    so nothing is ever silently dropped.
+    """
 
     if not user:
         return
 
     try:
-        await get_or_create_topic(user, context)
+
+        existing = await db_get_user(user.id)
+        is_new_customer = not (existing and existing.get("topic_id"))
+
+        topic_id = await get_or_create_topic(user, context)
+
+        if not topic_id:
+            logger.error(
+                "Backend setup failed for user %s after /%s "
+                "(user already received a reply).",
+                user.id, command_label.lower(),
+            )
+            return
+
+        if is_new_customer:
+            # _create_new_topic already posted the full "NEW PLAYER
+            # CONNECTED" card — nothing more to send.
+            return
+
+        await _send_to_group(
+            user,
+            context,
+            topic_id,
+            text=(
+                f"🔁 CUSTOMER USED /{command_label.lower()}\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"👤 Name     : {user.full_name or user.first_name or 'Unknown'}\n"
+                f"🔗 Username : @{user.username or 'No username'}\n"
+                f"🆔 ID       : {user.id}\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━"
+            )
+        )
+
     except Exception:
         logger.exception(
-            "Unhandled error ensuring topic exists for user %s", user.id
+            "Unhandled error finalizing /%s for user %s",
+            command_label.lower(), user.id,
         )
 
 
@@ -1179,7 +1248,7 @@ async def game_selected(
     )
 
     # 2) Backend work after.
-    asyncio.create_task(
+    fire_and_forget(
         _finalize_game_selection(user, context, game)
     )
 
