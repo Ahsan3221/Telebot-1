@@ -1,0 +1,16 @@
+# Credentials and local build artifacts
+.env
+.env.*
+!.env.example
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+# Archived legacy local SQLite files
+*.db
+*.db-wal
+*.db-shm
+support_data.json
+# Old Windows launch scripts
+Setup.bat
+run_bot.bat
