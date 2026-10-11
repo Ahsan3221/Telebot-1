@@ -78,6 +78,8 @@ def staff_role(update, s):
     uid = update.effective_user.id if update.effective_user else None
     if uid in s.cfg.owner_ids:
         return 'owner'
+    if uid in s.cfg.seed_staff:
+        return 'staff'  # IDs configured in Railway are always authorized.
     return s.roles.get(uid)
 
 
@@ -87,8 +89,8 @@ async def authorize(update, context, owner_only=False):
     if not message or not in_group(update, s):
         return False
     role = staff_role(update, s)
-    if role not in (('owner',) if owner_only else ('owner','admin','staff')):
-        await message.reply_text('⛔ Only authorized ' + ('owners' if owner_only else 'staff') + ' can use this command.')
+    if role not in ('owner', 'admin', 'staff'):
+        await message.reply_text('⛔ Only authorized staff can use this command.')
         return False
     return True
 
@@ -199,6 +201,8 @@ async def get_topic(user,context,game=None,source=None,bonus=None):
     s=state(context)
     async with s.lock(user.id):
         row=await s.db.upsert_user(user,game=game,source=source,bonus=bonus)
+        if row.get('is_blocked'):
+            raise BlockedCustomer(f'Customer {user.id} is blocked')
         if row['topic_id']:
             if row['topic_status']=='closed':
                 result=await _recover_topic_locked(user,s,context.bot,row)
@@ -244,6 +248,8 @@ async def deliver_job(application, s, job):
     if not row:
         return True
     direction=job['direction']
+    if row.get('is_blocked'):
+        return True  # Cancel queued copies and messages once customer is blocked.
     if direction=='broadcast' and not row['marketing_opt_in']:
         return True  # honor a subsequent /optout even if previously queued
     if direction=='customer':
@@ -353,9 +359,30 @@ async def enqueue_incoming(s,uid,direction,message):
     return jid
 
 
+
+class BlockedCustomer(Exception):
+    """Customer is suspended from bot-managed support messages."""
+
+
+async def _reject_blocked(update, context):
+    user = update.effective_user
+    if not user:
+        return False
+    customer = await state(context).db.user(user.id)
+    if customer and customer.get('is_blocked'):
+        notice = '⛔ Your support access is currently blocked. Contact the support team to request a review.'
+        if update.callback_query:
+            await update.callback_query.answer(notice, show_alert=True)
+        elif update.effective_message:
+            await update.effective_message.reply_text(notice)
+        return True
+    return False
+
+
 async def customer_start(update,context):
     if not in_private(update):
         return
+    if await _reject_blocked(update,context): return
     user=update.effective_user
     game=parse_game(context.args or [])
     source=parse_source(context.args or [])
@@ -384,6 +411,7 @@ async def help_command(update,context):
 async def game_list(update,context):
     if not in_private(update):
         return
+    if await _reject_blocked(update,context): return
     await get_topic(update.effective_user,context)
     await update.message.reply_text('🎮 Choose your game:',reply_markup=game_keyboard())
 
@@ -391,6 +419,7 @@ async def game_list(update,context):
 async def support(update,context):
     if not in_private(update):
         return
+    if await _reject_blocked(update,context): return
     await get_topic(update.effective_user,context)
     await update.message.reply_text('💬 Send your message here. You can also choose a game:',reply_markup=game_keyboard())
 
@@ -399,6 +428,7 @@ async def customer_choice(update,context):
     query=update.callback_query
     if not query or not in_private(update):
         return
+    if await _reject_blocked(update,context): return
     await query.answer()
     u=update.effective_user
     if query.data.startswith('bonus:'):
@@ -420,6 +450,7 @@ async def customer_choice(update,context):
 async def customer_message(update,context):
     if not in_private(update) or not update.message:
         return
+    if await _reject_blocked(update,context): return
     user=update.effective_user
     try:
         await get_topic(user,context)
@@ -568,6 +599,54 @@ async def cmd_assign(u,c): await edit_profile(u,c,'assign')
 async def cmd_deposit(u,c): await edit_profile(u,c,'deposit')
 
 
+
+async def set_customer_block(update,context,blocked):
+    """Block or unblock an existing customer from their topic or by Telegram ID."""
+    if not await authorize(update,context): return
+    s=state(context)
+    args=list(context.args or [])
+    uid=None
+    if args and args[0].isdigit() and int(args[0])>0:
+        uid=int(args.pop(0))
+    else:
+        mid=update.effective_message.message_thread_id
+        if mid and mid!=1:
+            mapped=await s.db.by_topic(mid)
+            if mapped: uid=int(mapped['user_id'])
+    if not uid:
+        await update.message.reply_text('Usage in a customer topic: /block [reason] or /unblock\nAnywhere in support group: /block <telegram_id> [reason]')
+        return
+    row=await s.db.user(uid)
+    if not row:
+        await update.message.reply_text(f'Customer {uid} not found in this bot.')
+        return
+    reason=' '.join(args).strip()[:250]
+    if bool(row.get('is_blocked'))==blocked:
+        await update.message.reply_text(f'ℹ️ Customer {uid} is already {"blocked" if blocked else "unblocked"}.')
+        return
+    ok=await s.db.set_blocked(uid,blocked,update.effective_user.id,reason)
+    if not ok:
+        await update.message.reply_text('Could not update the customer. Please retry.')
+        return
+    try:
+        await refresh_profile(s,context.bot,uid)
+    except Exception:
+        log.exception('Could not refresh block status in profile user=%s',uid)
+    await update.message.reply_text(
+        f'{"⛔ Blocked" if blocked else "✅ Unblocked"} customer {uid}. '
+        + ('New inbound messages and queued outgoing deliveries are disabled.' if blocked
+           else 'Support messaging can resume.') +
+        (f'\nReason: {reason}' if reason else ''))
+
+
+async def block_customer(update,context):
+    await set_customer_block(update,context,True)
+
+
+async def unblock_customer(update,context):
+    await set_customer_block(update,context,False)
+
+
 async def show_accounts(update,context):
     """Detailed view; pinned profiles intentionally only show game usernames."""
     row=await topic_customer(update,context)
@@ -653,8 +732,8 @@ async def staff_modify(update,context,remove=False):
         await update.message.reply_text('Usage: /addstaff <telegram_id> [name] or /removestaff <telegram_id>')
         return
     uid=int(args[0]); s=state(context)
-    if uid in s.cfg.owner_ids:
-        await update.message.reply_text('Owner access is controlled by OWNER_IDS and cannot be changed here.')
+    if uid in (s.cfg.owner_ids | s.cfg.seed_staff):
+        await update.message.reply_text('Railway-configured IDs must be managed in environment variables.')
         return
     name=' '.join(args[1:])[:100] or 'Staff'
     await s.db.staff_set(uid,name,'staff',not remove)
@@ -777,7 +856,7 @@ async def optout(update,context):
 
 
 async def broadcast(update,context):
-    if not await authorize(update,context,owner_only=True): return
+    if not await authorize(update,context): return
     args=list(context.args or [])
     label=None
     if args and args[0].startswith('--label='):
@@ -802,15 +881,15 @@ async def broadcast_callback(update,context):
     if not q or not in_group(update,state(context)):
         return
     s=state(context)
-    if not owner(update,s):
-        await q.answer('Only a bot owner can confirm.',show_alert=True);return
+    if staff_role(update,s) not in ('owner','admin','staff'):
+        await q.answer('Only authorized staff can confirm.',show_alert=True);return
     parts=(q.data or '').split(':')
     if len(parts)!=3 or not parts[2].isdigit():return
     bid=int(parts[2]);ok=parts[1]=='yes'
     count=await s.db.broadcast_confirm(bid,update.effective_user.id,ok)
     await q.answer()
     if count is None:
-        await q.edit_message_text('Draft expired, was already handled, or belongs to another owner.')
+        await q.edit_message_text('Draft expired, was already handled, or belongs to another staff member.')
     elif not ok:
         await q.edit_message_text(f'Broadcast #{bid} cancelled.')
     else:
@@ -840,10 +919,11 @@ async def post_init(app):
               BotCommand('assign','Assign employee'),BotCommand('use','Send saved reply'),
               BotCommand('shortcuts','List saved replies'),BotCommand('close','Close topic'),
               BotCommand('stats','Statistics'),BotCommand('staff','Staff list'),
-              BotCommand('deposit','Owner: record a deposit'),BotCommand('broadcast','Owner: opt-in broadcast'),
-              BotCommand('health','Owner: queue health'),BotCommand('addstaff','Owner: add staff'),
-              BotCommand('removestaff','Owner: remove staff'),
-              BotCommand('addshortcut','Owner: create reply'),BotCommand('delshortcut','Owner: remove reply')]
+              BotCommand('block','Block customer'),BotCommand('unblock','Unblock customer'),
+              BotCommand('deposit','Staff: record a deposit'),BotCommand('broadcast','Staff: opt-in broadcast'),
+              BotCommand('health','Staff: queue health'),BotCommand('addstaff','Staff: add staff'),
+              BotCommand('removestaff','Staff: remove staff'),
+              BotCommand('addshortcut','Staff: create reply'),BotCommand('delshortcut','Staff: remove reply')]
     try:
         await app.bot.set_my_commands(commands,scope=BotCommandScopeChat(chat_id=s.cfg.group_id))
     except TelegramError as exc:
@@ -887,6 +967,7 @@ def build_app(cfg=None,db=None):
         'status':cmd_status,'assign':cmd_assign,'deposit':cmd_deposit,
         'close':close_topic,'stats':stats,'health':health,
         'staff':staff_list,'addstaff':addstaff,'removestaff':removestaff,
+        'block':block_customer,'unblock':unblock_customer,
         'shortcuts':shortcut_list,'addshortcut':addshortcut,
         'delshortcut':delshortcut,'use':use_shortcut,'broadcast':broadcast,
     }

@@ -142,6 +142,7 @@ def profile_text(row, accounts=(), labels=(), notes=(), deposits=()):
         f'🏷 {tags}\n'
         f"🎮 Selected: {row.get('game') or 'None'}\n"
         f"📋 Status: {row.get('workflow_status') or 'new'}\n"
+        f"🚫 Support access: {'BLOCKED' if row.get('is_blocked') else 'ACTIVE'}\n"
         f"👨‍💼 Assigned staff ID: {row.get('assigned_staff') or 'Unassigned'}\n"
         '━━━━━━━━━━━━━━━━━━\n'
         f'🎮 SAVED GAME ACCOUNTS\n{acct}\n'

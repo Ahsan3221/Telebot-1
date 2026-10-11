@@ -70,6 +70,7 @@ class Database:
                 ("assigned_staff", "BIGINT"),
                 ("profile_message_id", "BIGINT"),
                 ("marketing_opt_in", "BOOLEAN NOT NULL DEFAULT FALSE"),
+                ("is_blocked", "BOOLEAN NOT NULL DEFAULT FALSE"),
             ):
                 cur.execute(f"ALTER TABLE {U} ADD COLUMN IF NOT EXISTS {column} {definition}")
             cur.execute(f"""CREATE TABLE IF NOT EXISTS {T} (
@@ -358,6 +359,17 @@ class Database:
             return cur.fetchone()
         return await self.call(fn)
 
+    async def set_blocked(self,uid,blocked,actor,reason=''):
+        """Persist support access restriction with an audit entry."""
+        def fn(cur):
+            cur.execute(f"UPDATE {U} SET is_blocked=%s WHERE user_id=%s RETURNING user_id",
+                        (bool(blocked),uid))
+            if not cur.fetchone():
+                return False
+            self._audit(cur,uid,actor,'blocked' if blocked else 'unblocked',reason or '')
+            return True
+        return await self.call(fn)
+
     async def opt_in(self,uid,enabled):
         def fn(cur):
             cur.execute(f"UPDATE {U} SET marketing_opt_in=%s WHERE user_id=%s",(enabled,uid))
@@ -446,9 +458,9 @@ class Database:
             cur.execute(f"INSERT INTO {B}(author_id,body,label) VALUES(%s,%s,%s) RETURNING id",(author,body,label))
             draft=cur.fetchone()['id']
             if label:
-                cur.execute(f"SELECT COUNT(*) c FROM {U} WHERE marketing_opt_in AND EXISTS(SELECT 1 FROM {L} WHERE user_id={U}.user_id AND LOWER(label)=LOWER(%s))",(label,))
+                cur.execute(f"SELECT COUNT(*) c FROM {U} WHERE marketing_opt_in AND NOT is_blocked AND EXISTS(SELECT 1 FROM {L} WHERE user_id={U}.user_id AND LOWER(label)=LOWER(%s))",(label,))
             else:
-                cur.execute(f"SELECT COUNT(*) c FROM {U} WHERE marketing_opt_in")
+                cur.execute(f"SELECT COUNT(*) c FROM {U} WHERE marketing_opt_in AND NOT is_blocked")
             return draft,cur.fetchone()['c']
         return await self.call(fn)
 
@@ -464,9 +476,9 @@ class Database:
             cur.execute(f"UPDATE {B} SET state='queued',confirmed_at=NOW() WHERE id=%s",(bid,))
             label=row['label']
             if label:
-                cur.execute(f"SELECT user_id,name FROM {U} WHERE marketing_opt_in AND EXISTS(SELECT 1 FROM {L} WHERE user_id={U}.user_id AND LOWER(label)=LOWER(%s))",(label,))
+                cur.execute(f"SELECT user_id,name FROM {U} WHERE marketing_opt_in AND NOT is_blocked AND EXISTS(SELECT 1 FROM {L} WHERE user_id={U}.user_id AND LOWER(label)=LOWER(%s))",(label,))
             else:
-                cur.execute(f"SELECT user_id,name FROM {U} WHERE marketing_opt_in")
+                cur.execute(f"SELECT user_id,name FROM {U} WHERE marketing_opt_in AND NOT is_blocked")
             customers=cur.fetchall()
             for user in customers:
                 first=(user['name'] or 'there').split(' ')[0]
