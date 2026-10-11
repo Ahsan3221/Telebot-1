@@ -75,12 +75,47 @@ def owner(update, s):
 
 
 def staff_role(update, s):
+    """Resolve saved and Railway staff independently of optional role labels."""
     uid = update.effective_user.id if update.effective_user else None
+    if uid is None:
+        return None
     if uid in s.cfg.owner_ids:
         return 'owner'
     if uid in s.cfg.seed_staff:
-        return 'staff'  # IDs configured in Railway are always authorized.
-    return s.roles.get(uid)
+        return 'staff'
+    role = s.roles.get(uid)
+    if role is None:
+        return None
+    # roles() queries only active staff. Historical role labels remain authorized.
+    return role if role in ('owner', 'admin', 'staff') else 'staff'
+
+
+async def staff_access(update, context):
+    """One canonical access check for commands, callbacks and forum replies."""
+    s = state(context)
+    if not update.effective_user or not in_group(update, s):
+        return None
+    role = staff_role(update, s)
+    if role:
+        return role
+    try:
+        s.roles = await s.db.roles()
+    except Exception as exc:
+        log.warning('Could not refresh staff roles for id=%s: %s',
+                    update.effective_user.id, exc)
+    role = staff_role(update, s)
+    if role:
+        return role
+    try:
+        member = await context.bot.get_chat_member(
+            chat_id=s.cfg.group_id, user_id=update.effective_user.id)
+        status = getattr(member.status, 'value', member.status)
+        if str(status).lower() in ('administrator', 'creator', 'owner'):
+            return 'admin'
+    except Exception as exc:
+        log.info('Telegram admin lookup unavailable user=%s: %s',
+                 update.effective_user.id, exc)
+    return None
 
 
 async def authorize(update, context, owner_only=False):
@@ -88,11 +123,49 @@ async def authorize(update, context, owner_only=False):
     message = update.effective_message
     if not message or not in_group(update, s):
         return False
-    role = staff_role(update, s)
-    if role not in ('owner', 'admin', 'staff'):
-        await message.reply_text('⛔ Only authorized staff can use this command.')
+    role = await staff_access(update, context)
+    if not role:
+        uid = update.effective_user.id if update.effective_user else 'unknown'
+        if getattr(message, 'sender_chat', None):
+            await message.reply_text(
+                '⛔ Anonymous admin mode hides your personal Telegram ID. '
+                'Post as your own account, then retry /staffcheck.')
+        else:
+            await message.reply_text(
+                f'⛔ Staff access not found for Telegram ID {uid}. '
+                'Send /staffcheck here to see exactly what is missing.')
+        log.warning('Staff authorization rejected: user_id=%s chat_id=%s; '
+                    'configured_ids=%d active_db_staff=%d',
+                    uid, update.effective_chat.id,
+                    len(s.cfg.owner_ids | s.cfg.seed_staff), len(s.roles))
         return False
     return True
+
+
+async def staffcheck(update, context):
+    """Self-service, non-privileged staff authorization diagnostics."""
+    s = state(context)
+    msg = update.effective_message
+    if not msg or not in_group(update, s):
+        return
+    actor = update.effective_user
+    uid = actor.id if actor else None
+    role = await staff_access(update, context)
+    sources = getattr(s.cfg, 'staff_id_sources', {}).get(uid, ())
+    in_db = s.roles.get(uid) if uid is not None else None
+    anonymous = bool(getattr(msg, 'sender_chat', None))
+    await msg.reply_text(
+        f'🔎 STAFF ACCESS CHECK\n'
+        f'👤 Telegram ID: {uid or "unknown"}\n'
+        f'📍 Group: {update.effective_chat.id}\n'
+        f'🗄️ Active DB role: {in_db or "not found"}\n'
+        f'⚙️ Railway ID variable(s): {", ".join(sorted(sources)) or "not found"}\n'
+        f'🛡️ Effective permission: {role or "NOT AUTHORIZED"}\n'
+        + ('⚠️ You are posting anonymously. Turn anonymous admin off.\n'
+           if anonymous else '')
+        + ('Ask a staff admin to use /addstaff with this Telegram ID, '
+           'or add it to a Railway staff ID variable and redeploy.'
+           if not role else '✅ Broadcast and CRM commands are enabled.'))
 
 
 async def topic_customer(update, context, owner_only=False):
@@ -514,7 +587,7 @@ async def group_message(update,context):
     msg=update.message
     if not msg or not in_group(update,s) or not msg.from_user or msg.from_user.is_bot:
         return
-    if not staff_role(update,s):
+    if not await staff_access(update,context):
         log.warning('Ignored unauthorized group message from id=%s',msg.from_user.id)
         return
     tid=msg.message_thread_id
@@ -975,8 +1048,8 @@ async def broadcast_callback(update,context):
     if not q or not in_group(update,state(context)):
         return
     s=state(context)
-    if staff_role(update,s) not in ('owner','admin','staff'):
-        await q.answer('Only authorized staff can confirm.',show_alert=True);return
+    if not await staff_access(update,context):
+        await q.answer('Only authorized staff can confirm. Use /staffcheck.',show_alert=True);return
     parts=(q.data or '').split(':')
     if len(parts)!=3 or not parts[2].isdigit():return
     bid=int(parts[2]);ok=parts[1]=='yes'
@@ -1015,6 +1088,7 @@ async def post_init(app):
               BotCommand('stats','Statistics'),BotCommand('staff','Staff list'),
               BotCommand('block','Block customer'),BotCommand('unblock','Unblock customer'),
               BotCommand('deposit','Staff: record a deposit'),BotCommand('broadcast','Staff: customer broadcast'),
+              BotCommand('staffcheck','Check your staff access'),
               BotCommand('bstatus','Broadcast delivery status'),
               BotCommand('bcheck','Check player broadcast'),
               BotCommand('health','Staff: queue health'),BotCommand('addstaff','Staff: add staff'),
@@ -1067,6 +1141,7 @@ def build_app(cfg=None,db=None):
         'shortcuts':shortcut_list,'addshortcut':addshortcut,
         'delshortcut':delshortcut,'use':use_shortcut,'broadcast':broadcast,
         'bstatus':broadcast_status,'bcheck':broadcast_check,
+        'staffcheck':staffcheck,
     }
     for command,handler in staff_commands.items():
         app.add_handler(CommandHandler(command,handler,filters=group))
