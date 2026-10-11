@@ -75,10 +75,21 @@ def test_outbox_customer_copy(monkeypatch):
 
 def test_optout_prevents_queued_broadcast(monkeypatch):
     bot=load_bot_stubbed(monkeypatch)
-    db=types.SimpleNamespace(user=AsyncMock(return_value={'topic_id':918,'marketing_opt_in':False}))
+    db=types.SimpleNamespace(user=AsyncMock(return_value={'topic_id':918,'marketing_opt_in':False,'marketing_opted_out':True}))
     api=types.SimpleNamespace(send_message=AsyncMock())
     s=types.SimpleNamespace(db=db,cfg=types.SimpleNamespace(group_id=123))
     result=asyncio.run(bot.deliver_job(types.SimpleNamespace(bot=api),s,
                                         {'user_id':77,'direction':'broadcast','body':'Promo'}))
     assert result is True
     api.send_message.assert_not_awaited()
+
+
+def test_legacy_false_flag_no_longer_filters_registered_players(monkeypatch):
+    bot=load_bot_stubbed(monkeypatch)
+    db=types.SimpleNamespace(user=AsyncMock(return_value={
+        'topic_id':918,'marketing_opt_in':False,'marketing_opted_out':False,'is_blocked':False}))
+    api=types.SimpleNamespace(send_message=AsyncMock())
+    s=types.SimpleNamespace(db=db,cfg=types.SimpleNamespace(group_id=-10088))
+    asyncio.run(bot.deliver_job(types.SimpleNamespace(bot=api),s,
+                                {'user_id':77,'direction':'broadcast','body':'Promo'}))
+    api.send_message.assert_awaited_once_with(chat_id=77,text='Promo')

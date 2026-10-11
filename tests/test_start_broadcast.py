@@ -39,9 +39,9 @@ def test_first_start_enrolls_only_new_customers():
 
 def test_broadcast_remains_optout_respecting():
     database=(ROOT/"database.py").read_text(encoding="utf-8")
-    assert database.count("WHERE marketing_opt_in AND NOT is_blocked") >= 2
+    assert database.count("WHERE NOT is_blocked AND NOT bot_blocked AND NOT marketing_opted_out") >= 2
     assert "async def opt_in(" in database
-    assert "marketing_opt_in=%s" in database
+    assert "marketing_opted_out=%s" in database
 
 
 def test_no_extra_customer_welcome_notice():

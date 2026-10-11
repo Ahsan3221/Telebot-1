@@ -18,6 +18,7 @@ O = "wishwheel_outbox"
 Q = "wishwheel_shortcuts"
 B = "wishwheel_broadcasts"
 C = "wishwheel_account_captures"
+M = B + "_mirrors"
 
 
 class Database:
@@ -70,7 +71,9 @@ class Database:
                 ("assigned_staff", "BIGINT"),
                 ("profile_message_id", "BIGINT"),
                 ("marketing_opt_in", "BOOLEAN NOT NULL DEFAULT FALSE"),
+                ("marketing_opted_out", "BOOLEAN NOT NULL DEFAULT FALSE"),
                 ("is_blocked", "BOOLEAN NOT NULL DEFAULT FALSE"),
+                ("bot_blocked", "BOOLEAN NOT NULL DEFAULT FALSE"),
             ):
                 cur.execute(f"ALTER TABLE {U} ADD COLUMN IF NOT EXISTS {column} {definition}")
             cur.execute(f"""CREATE TABLE IF NOT EXISTS {T} (
@@ -131,6 +134,12 @@ class Database:
                 id BIGSERIAL PRIMARY KEY, author_id BIGINT NOT NULL, body TEXT NOT NULL,
                 label TEXT, state TEXT NOT NULL DEFAULT 'draft',
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), confirmed_at TIMESTAMPTZ)""")
+            # Mirror jobs are added only after the private Telegram send succeeded.
+            cur.execute(f"""CREATE TABLE IF NOT EXISTS {M} (
+                broadcast_job_id BIGINT PRIMARY KEY REFERENCES {O}(id) ON DELETE CASCADE,
+                state TEXT NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0,
+                next_attempt TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                locked_until TIMESTAMPTZ, last_error TEXT NOT NULL DEFAULT '')""")
             # One active forum topic per user. Clean up stale historical topic aliases.
             cur.execute(f"CREATE INDEX IF NOT EXISTS wishwheel_users_topic_lookup ON {U}(topic_id) WHERE topic_id IS NOT NULL")
             cur.execute(f"CREATE INDEX IF NOT EXISTS wishwheel_users_activity ON {U}(last_seen)")
@@ -169,7 +178,8 @@ class Database:
                     game=COALESCE(EXCLUDED.game,{U}.game),
                     source=COALESCE(EXCLUDED.source,{U}.source),
                     bonus=COALESCE(EXCLUDED.bonus,{U}.bonus),
-                    last_seen=CASE WHEN %s THEN NOW() ELSE {U}.last_seen END
+                    last_seen=CASE WHEN %s THEN NOW() ELSE {U}.last_seen END,
+                    bot_blocked=FALSE
                 RETURNING *""", (user.id, user.full_name or user.first_name or 'Unknown',
                                   user.username or '', game,source,bonus,touch))
             return dict(cur.fetchone())
@@ -372,7 +382,8 @@ class Database:
 
     async def opt_in(self,uid,enabled):
         def fn(cur):
-            cur.execute(f"UPDATE {U} SET marketing_opt_in=%s WHERE user_id=%s",(enabled,uid))
+            cur.execute(f"UPDATE {U} SET marketing_opt_in=%s,marketing_opted_out=%s WHERE user_id=%s",
+                        (bool(enabled),not bool(enabled),uid))
         await self.call(fn)
 
     async def outbox_enqueue(self,uid,direction,source_chat=None,source_message=None,body=None,key=None):
@@ -402,7 +413,11 @@ class Database:
     async def outbox_result(self,job_id,success,error='',retry_seconds=0):
         def fn(cur):
             if success:
-                cur.execute(f"UPDATE {O} SET state='sent', delivered_at=NOW(),locked_until=NULL,last_error='' WHERE id=%s",(job_id,))
+                cur.execute(f"""UPDATE {O} SET state='sent',delivered_at=NOW(),
+                    locked_until=NULL,last_error='' WHERE id=%s RETURNING direction""",(job_id,))
+                sent=cur.fetchone()
+                if sent and sent['direction']=='broadcast':
+                    cur.execute(f"INSERT INTO {M}(broadcast_job_id) VALUES(%s) ON CONFLICT DO NOTHING",(job_id,))
             elif retry_seconds:
                 cur.execute(f"""UPDATE {O} SET state='pending', locked_until=NULL,
                     next_attempt=NOW()+(%s * INTERVAL '1 second'),last_error=%s WHERE id=%s""",
@@ -410,6 +425,86 @@ class Database:
             else:
                 cur.execute(f"UPDATE {O} SET state='dead',locked_until=NULL,last_error=%s WHERE id=%s",(error[:300],job_id))
         await self.call(fn)
+
+    async def mark_bot_blocked(self,uid,blocked=True):
+        def fn(cur):
+            cur.execute(f"UPDATE {U} SET bot_blocked=%s WHERE user_id=%s",(bool(blocked),uid))
+        await self.call(fn)
+
+    async def outbox_claim_mirror(self):
+        """Mirrors successful broadcasts; never repeats the customer send."""
+        def fn(cur):
+            cur.execute(f"""SELECT m.broadcast_job_id AS id,m.attempts,o.user_id,o.body,
+                u.topic_id,u.topic_status
+                FROM {M} m JOIN {O} o ON o.id=m.broadcast_job_id
+                JOIN {U} u ON u.user_id=o.user_id
+                WHERE (m.state='pending' AND m.next_attempt<=NOW())
+                   OR (m.state='processing' AND m.locked_until<NOW())
+                ORDER BY m.broadcast_job_id ASC
+                LIMIT 1 FOR UPDATE SKIP LOCKED""")
+            row=cur.fetchone()
+            if row:
+                cur.execute(f"""UPDATE {M} SET state='processing',attempts=attempts+1,
+                    locked_until=NOW()+INTERVAL '2 minutes' WHERE broadcast_job_id=%s""",(row['id'],))
+            return row
+        return await self.call(fn)
+
+    async def outbox_mirror_result(self,job_id,success,error='',retry_seconds=0,skipped=False):
+        def fn(cur):
+            if skipped:
+                cur.execute(f"UPDATE {M} SET state='skipped',locked_until=NULL WHERE broadcast_job_id=%s",(job_id,))
+            elif success:
+                cur.execute(f"UPDATE {M} SET state='sent',locked_until=NULL,last_error='' WHERE broadcast_job_id=%s",(job_id,))
+            elif retry_seconds:
+                cur.execute(f"""UPDATE {M} SET state='pending',locked_until=NULL,
+                    next_attempt=NOW()+(%s * INTERVAL '1 second'),last_error=%s
+                    WHERE broadcast_job_id=%s""",(retry_seconds,error[:300],job_id))
+            else:
+                cur.execute(f"UPDATE {M} SET state='dead',locked_until=NULL,last_error=%s WHERE broadcast_job_id=%s",(error[:300],job_id))
+        await self.call(fn)
+
+    async def broadcast_report(self,bid=None):
+        def fn(cur):
+            if bid is None:
+                cur.execute(f"SELECT id,state FROM {B} ORDER BY id DESC LIMIT 1")
+            else:
+                cur.execute(f"SELECT id,state FROM {B} WHERE id=%s",(bid,))
+            record=cur.fetchone()
+            if not record:return None
+            pattern=f"broadcast:{record['id']}:%"
+            cur.execute(f"""SELECT state,COUNT(*) c FROM {O}
+                WHERE direction='broadcast' AND idempotency_key LIKE %s
+                GROUP BY state""",(pattern,))
+            delivery={r['state']:r['c'] for r in cur.fetchall()}
+            cur.execute(f"""SELECT m.state,COUNT(*) c FROM {M} m JOIN {O} o
+                ON o.id=m.broadcast_job_id
+                WHERE o.idempotency_key LIKE %s GROUP BY m.state""",(pattern,))
+            mirrors={r['state']:r['c'] for r in cur.fetchall()}
+            cur.execute(f"""SELECT user_id,last_error FROM {O}
+                WHERE direction='broadcast' AND idempotency_key LIKE %s
+                AND state='dead' ORDER BY id LIMIT 3""",(pattern,))
+            return dict(id=record['id'],status=record['state'],delivery=delivery,
+                        mirror=mirrors,errors=cur.fetchall())
+        return await self.call(fn)
+
+    async def broadcast_check(self,uid,bid=None):
+        def fn(cur):
+            cur.execute(f"SELECT user_id,name,topic_id,is_blocked,bot_blocked FROM {U} WHERE user_id=%s",(uid,))
+            recipient=cur.fetchone()
+            if not recipient:return None
+            if bid is None:
+                cur.execute(f"""SELECT o.id,o.state,o.attempts,o.last_error,
+                    m.state AS mirror_state,m.last_error AS mirror_error
+                    FROM {O} o LEFT JOIN {M} m ON m.broadcast_job_id=o.id
+                    WHERE o.user_id=%s AND o.direction='broadcast' ORDER BY o.id DESC LIMIT 1""",(uid,))
+            else:
+                cur.execute(f"""SELECT o.id,o.state,o.attempts,o.last_error,
+                    m.state AS mirror_state,m.last_error AS mirror_error
+                    FROM {O} o LEFT JOIN {M} m ON m.broadcast_job_id=o.id
+                    WHERE o.user_id=%s AND o.direction='broadcast'
+                    AND o.idempotency_key=%s ORDER BY o.id DESC LIMIT 1""",(uid,f'broadcast:{bid}:{uid}'))
+            return dict(user=recipient,delivery=cur.fetchone())
+        return await self.call(fn)
 
     async def outbox_counts(self):
         def fn(cur):
@@ -458,9 +553,9 @@ class Database:
             cur.execute(f"INSERT INTO {B}(author_id,body,label) VALUES(%s,%s,%s) RETURNING id",(author,body,label))
             draft=cur.fetchone()['id']
             if label:
-                cur.execute(f"SELECT COUNT(*) c FROM {U} WHERE marketing_opt_in AND NOT is_blocked AND EXISTS(SELECT 1 FROM {L} WHERE user_id={U}.user_id AND LOWER(label)=LOWER(%s))",(label,))
+                cur.execute(f"SELECT COUNT(*) c FROM {U} WHERE NOT is_blocked AND NOT bot_blocked AND NOT marketing_opted_out AND EXISTS(SELECT 1 FROM {L} WHERE user_id={U}.user_id AND LOWER(label)=LOWER(%s))",(label,))
             else:
-                cur.execute(f"SELECT COUNT(*) c FROM {U} WHERE marketing_opt_in AND NOT is_blocked")
+                cur.execute(f"SELECT COUNT(*) c FROM {U} WHERE NOT is_blocked AND NOT bot_blocked AND NOT marketing_opted_out")
             return draft,cur.fetchone()['c']
         return await self.call(fn)
 
@@ -476,9 +571,14 @@ class Database:
             cur.execute(f"UPDATE {B} SET state='queued',confirmed_at=NOW() WHERE id=%s",(bid,))
             label=row['label']
             if label:
-                cur.execute(f"SELECT user_id,name FROM {U} WHERE marketing_opt_in AND NOT is_blocked AND EXISTS(SELECT 1 FROM {L} WHERE user_id={U}.user_id AND LOWER(label)=LOWER(%s))",(label,))
+                cur.execute(f"""SELECT user_id,name FROM {U}
+                    WHERE NOT is_blocked AND NOT bot_blocked AND NOT marketing_opted_out
+                    AND EXISTS(SELECT 1 FROM {L} WHERE user_id={U}.user_id AND LOWER(label)=LOWER(%s))
+                    ORDER BY last_seen ASC,topic_id ASC,user_id ASC""",(label,))
             else:
-                cur.execute(f"SELECT user_id,name FROM {U} WHERE marketing_opt_in AND NOT is_blocked")
+                cur.execute(f"""SELECT user_id,name FROM {U}
+                    WHERE NOT is_blocked AND NOT bot_blocked AND NOT marketing_opted_out
+                    ORDER BY last_seen ASC,topic_id ASC,user_id ASC""")
             customers=cur.fetchall()
             for user in customers:
                 first=(user['name'] or 'there').split(' ')[0]

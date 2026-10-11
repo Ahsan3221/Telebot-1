@@ -78,11 +78,13 @@ def test_broadcast_create_by_staff_and_confirm_authorship():
             args=["Hello","subscribers"],application=SimpleNamespace(bot_data={"state":state}))
         await bot.broadcast(update,context)
         db.broadcast_draft.assert_awaited_once_with(12,"Hello subscribers",None)
+        db.broadcast_confirm.assert_awaited_once_with(51,12,True)
+        db.broadcast_confirm.reset_mock()
         q=SimpleNamespace(data="bc:yes:51",answer=AsyncMock(),edit_message_text=AsyncMock())
         click=SimpleNamespace(**common, callback_query=q,effective_message=msg)
         await bot.broadcast_callback(click,context)
         db.broadcast_confirm.assert_awaited_once_with(51,12,True)
-        state.delivery_wakeup.set.assert_called_once()
+        assert state.delivery_wakeup.set.call_count == 2
     asyncio.run(check())
 
 
@@ -93,7 +95,7 @@ def test_blocked_inbound_and_queued_deliveries_are_rejected():
     assert "if row.get('is_blocked'):" in source
     assert "if await _reject_blocked(update,context)" in source
     assert '"is_blocked", "BOOLEAN NOT NULL DEFAULT FALSE"' in db
-    assert "WHERE marketing_opt_in AND NOT is_blocked" in db
+    assert "WHERE NOT is_blocked AND NOT bot_blocked AND NOT marketing_opted_out" in db
     assert "async def set_blocked" in db
     if MODULE == "crm_runtime":
         legacy=(ROOT/"bot.py").read_text()

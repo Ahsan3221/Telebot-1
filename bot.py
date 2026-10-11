@@ -250,8 +250,8 @@ async def deliver_job(application, s, job):
     direction=job['direction']
     if row.get('is_blocked'):
         return True  # Cancel queued copies and messages once customer is blocked.
-    if direction=='broadcast' and not row['marketing_opt_in']:
-        return True  # honor a subsequent /optout even if previously queued
+    if direction=='broadcast' and (row.get('marketing_opted_out') or row.get('bot_blocked')):
+        return True  # Preserve explicit stop requests and avoid unreachable players
     if direction=='customer':
         tid=row['topic_id']
         if not tid:
@@ -279,12 +279,47 @@ async def deliver_job(application, s, job):
     return True
 
 
+def unreachable_player(exc):
+    text=str(exc).casefold()
+    return any(term in text for term in (
+        'bot was blocked by the user', 'bot is blocked by the user',
+        'user is deactivated', 'chat not found', 'user not found'))
+
+
+async def mirror_one_broadcast(application,s):
+    """Copy delivered messages to staff without ever resending to the customer."""
+    job=await s.db.outbox_claim_mirror()
+    if job is None:
+        return False
+    job_id=int(job['id'])
+    if not job.get('topic_id') or job.get('topic_status')=='closed':
+        await s.db.outbox_mirror_result(job_id,False,skipped=True)
+        return True
+    try:
+        await application.bot.send_message(
+            chat_id=s.cfg.group_id, message_thread_id=int(job['topic_id']),
+            text=('📢 BROADCAST SENT\n\n'+(job.get('body') or ''))[:4000])
+    except RetryAfter as exc:
+        await s.db.outbox_mirror_result(job_id,False,str(exc),max(1,int(exc.retry_after)+1))
+    except Exception as exc:
+        attempt=int(job.get('attempts') or 0)+1
+        retry=0 if is_permanent_error(exc) or is_topic_missing(exc) or attempt>=s.cfg.max_delivery_attempts else retry_delay(attempt)
+        await s.db.outbox_mirror_result(job_id,False,str(exc),retry,
+                                         skipped=is_topic_missing(exc))
+        log.warning('Broadcast support topic mirror failed job=%s attempt=%d: %s',job_id,attempt,exc)
+    else:
+        await s.db.outbox_mirror_result(job_id,True)
+    return True
+
+
 async def outbox_worker(application,s):
     log.info('Persistent outbox worker started')
     while True:
         try:
             job=await s.db.outbox_claim()
             if job is None:
+                if await mirror_one_broadcast(application,s):
+                    continue
                 try:
                     await asyncio.wait_for(s.delivery_wakeup.wait(),timeout=1)
                 except asyncio.TimeoutError:
@@ -301,6 +336,11 @@ async def outbox_worker(application,s):
             except Exception as exc:
                 permanent=is_permanent_error(exc)
                 retry=0 if permanent or attempt>=s.cfg.max_delivery_attempts else retry_delay(attempt)
+                if job['direction']=='broadcast' and unreachable_player(exc):
+                    try:
+                        await s.db.mark_bot_blocked(int(job['user_id']),True)
+                    except Exception:
+                        log.exception('Failed to record bot-blocked customer %s',job['user_id'])
                 await s.db.outbox_result(job['id'],False,str(exc),retry)
                 log.warning('Delivery failed job=%s direction=%s attempt=%s retry=%s: %s',
                             job['id'],job['direction'],attempt,retry,exc)
@@ -321,6 +361,8 @@ async def outbox_worker(application,s):
                         pass
             else:
                 await s.db.outbox_result(job['id'],True)
+                if job['direction']=='broadcast':
+                    await mirror_one_broadcast(application,s)
             await asyncio.sleep(s.cfg.broadcast_gap if job['direction']=='broadcast' else 0.4)
         except asyncio.CancelledError:
             raise
@@ -854,24 +896,78 @@ async def optout(update,context):
 
 
 async def broadcast(update,context):
+    """Queue the registered customer audience immediately, with no opt-in prompt."""
     if not await authorize(update,context): return
     args=list(context.args or [])
     label=None
     if args and args[0].startswith('--label='):
-        try:label=normalize_label(args.pop(0).split('=',1)[1])
+        try: label=normalize_label(args.pop(0).split('=',1)[1])
         except ValueError as exc:
             await update.message.reply_text(str(exc));return
     body=' '.join(args).strip()
     if not body or len(body)>3000:
-        await update.message.reply_text('Usage: /broadcast [--label=VIP] <message> (up to 3000 chars)\nOnly eligible customers will receive it.')
+        await update.message.reply_text('Usage: /broadcast [--label=VIP] <message>')
         return
     s=state(context)
-    bid,count=await s.db.broadcast_draft(update.effective_user.id,body,label)
+    bid,_=await s.db.broadcast_draft(update.effective_user.id,body,label)
+    queued=await s.db.broadcast_confirm(bid,update.effective_user.id,True)
+    if queued is None:
+        await update.message.reply_text('⚠️ Could not queue broadcast. Please retry.')
+        return
+    s.delivery_wakeup.set()
     await update.message.reply_text(
-        f'📡 Broadcast preview #{bid}\nRecipients (eligible): {count}\nLabel: {label or "all"}\n\n{body[:500]}\n\nConfirm?',
-        reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton('Confirm',callback_data=f'bc:yes:{bid}'),
-            InlineKeyboardButton('Cancel',callback_data=f'bc:no:{bid}')]]))
+        f'📡 Broadcast #{bid} queued for {queued} registered customers.\n'
+        'Oldest/inactive chats first; minimum 1 second between customer deliveries.\n'
+        f'Progress: /bstatus {bid}\n'
+        'Check a player: /bcheck <telegram_id> '+str(bid))
+
+
+async def broadcast_status(update,context):
+    if not await authorize(update,context): return
+    args=context.args or []
+    if args and not args[0].isdigit():
+        await update.message.reply_text('Usage: /bstatus [broadcast_id]');return
+    report=await state(context).db.broadcast_report(int(args[0]) if args else None)
+    if not report:
+        await update.message.reply_text('No broadcast record found.');return
+    counts=report['delivery']; mirrors=report['mirror']
+    errors='\n'.join(
+        f" • {e['user_id']}: {short(e.get('last_error') or 'Unknown',100)}"
+        for e in report['errors'])
+    await update.message.reply_text(
+        f"📡 BROADCAST #{report['id']} ({report['status']})\n"
+        f"📨 Total queued: {sum(counts.values())}\n"
+        f"✅ Sent: {counts.get('sent',0)}\n"
+        f"⏳ Pending: {counts.get('pending',0)}\n"
+        f"🔄 Processing: {counts.get('processing',0)}\n"
+        f"❌ Failed: {counts.get('dead',0)}\n"
+        f"💬 Staff chat copies sent: {mirrors.get('sent',0)}\n"
+        f"⚠️ Copy failures: {mirrors.get('dead',0)}"
+        + (f"\nErrors:\n{errors}" if errors else ''))
+
+
+async def broadcast_check(update,context):
+    if not await authorize(update,context): return
+    args=context.args or []
+    if not args or not args[0].isdigit() or (len(args)>1 and not args[1].isdigit()):
+        await update.message.reply_text('Usage: /bcheck <telegram_id> [broadcast_id]');return
+    uid=int(args[0]);bid=int(args[1]) if len(args)>1 else None
+    report=await state(context).db.broadcast_check(uid,bid)
+    if not report:
+        await update.message.reply_text('That player is not registered in this bot.');return
+    player=report['user'];delivery=report['delivery']
+    body=(f'🔎 PLAYER {uid}\n'
+          f"👤 {short(player.get('name') or 'Unknown',75)}\n"
+          f"🚫 Staff block: {bool(player.get('is_blocked'))}\n"
+          f"🚫 Telegram unreachable: {bool(player.get('bot_blocked'))}\n")
+    if delivery:
+        body+=(f"📨 Delivery: {delivery['state']}\n"
+               f"🔁 Attempts: {delivery.get('attempts',0)}\n"
+               f"💬 Staff copy: {delivery.get('mirror_state') or 'not yet'}\n"
+               f"⚠️ Error: {short(delivery.get('last_error') or '-',200)}")
+    else:
+        body+='📨 No matching broadcast was queued for this player.'
+    await update.message.reply_text(body)
 
 
 async def broadcast_callback(update,context):
@@ -892,7 +988,7 @@ async def broadcast_callback(update,context):
         await q.edit_message_text(f'Broadcast #{bid} cancelled.')
     else:
         s.delivery_wakeup.set()
-        await q.edit_message_text(f'✅ Broadcast #{bid} queued for {count} opted-in customers. Check /health for delivery queue stats.')
+        await q.edit_message_text(f'✅ Broadcast #{bid} queued for {count} customers. Check /bstatus for delivery queue stats.')
 
 
 async def error_handler(update,context):
@@ -919,6 +1015,8 @@ async def post_init(app):
               BotCommand('stats','Statistics'),BotCommand('staff','Staff list'),
               BotCommand('block','Block customer'),BotCommand('unblock','Unblock customer'),
               BotCommand('deposit','Staff: record a deposit'),BotCommand('broadcast','Staff: customer broadcast'),
+              BotCommand('bstatus','Broadcast delivery status'),
+              BotCommand('bcheck','Check player broadcast'),
               BotCommand('health','Staff: queue health'),BotCommand('addstaff','Staff: add staff'),
               BotCommand('removestaff','Staff: remove staff'),
               BotCommand('addshortcut','Staff: create reply'),BotCommand('delshortcut','Staff: remove reply')]
@@ -968,6 +1066,7 @@ def build_app(cfg=None,db=None):
         'block':block_customer,'unblock':unblock_customer,
         'shortcuts':shortcut_list,'addshortcut':addshortcut,
         'delshortcut':delshortcut,'use':use_shortcut,'broadcast':broadcast,
+        'bstatus':broadcast_status,'bcheck':broadcast_check,
     }
     for command,handler in staff_commands.items():
         app.add_handler(CommandHandler(command,handler,filters=group))
