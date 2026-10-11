@@ -387,7 +387,14 @@ async def customer_start(update,context):
     game=parse_game(context.args or [])
     source=parse_source(context.args or [])
     try:
+        # A new /start activates ordinary bot updates without a separate /optin step.
+        # Legacy customers with marketing_opt_in=False are not silently re-enrolled:
+        # that historic value could represent a previous explicit /optout.
+        s=state(context)
+        previous=await s.db.user(user.id)
         await get_topic(user,context,game=game,source=source)
+        if previous is None:
+            await s.db.opt_in(user.id,True)
     except Exception:
         log.exception('Customer start failed user=%s',user.id)
         await update.message.reply_text('⚠️ Support is temporarily unavailable. Please try again shortly.')
@@ -404,7 +411,6 @@ async def help_command(update,context):
     await update.message.reply_text(
         f'{BRAND} SUPPORT\n/start — Begin support\n/games — Choose a game\n'
         '/support — Contact staff\n/privacy — Privacy policy\n/delete_data — Request account deletion\n'
-        '/optin — Subscribe to optional updates\n/optout — Stop optional updates\n'
         'Or simply send a message here.')
 
 
@@ -839,14 +845,6 @@ async def delete_callback(update,context):
     await q.edit_message_text('✅ Customer records were removed from the bot database and its support topic was deleted (if present). Other copies held outside this bot may remain.')
 
 
-async def optin(update,context):
-    if not in_private(update):return
-    s=state(context)
-    await s.db.upsert_user(update.effective_user)
-    await s.db.opt_in(update.effective_user.id,True)
-    await update.message.reply_text('✅ You opted in to optional service updates. Send /optout anytime.')
-
-
 async def optout(update,context):
     if not in_private(update):return
     s=state(context)
@@ -865,12 +863,12 @@ async def broadcast(update,context):
             await update.message.reply_text(str(exc));return
     body=' '.join(args).strip()
     if not body or len(body)>3000:
-        await update.message.reply_text('Usage: /broadcast [--label=VIP] <message> (up to 3000 chars)\nOnly opted-in customers will receive it.')
+        await update.message.reply_text('Usage: /broadcast [--label=VIP] <message> (up to 3000 chars)\nOnly eligible customers will receive it.')
         return
     s=state(context)
     bid,count=await s.db.broadcast_draft(update.effective_user.id,body,label)
     await update.message.reply_text(
-        f'📡 Broadcast preview #{bid}\nRecipients (opted in): {count}\nLabel: {label or "all"}\n\n{body[:500]}\n\nConfirm?',
+        f'📡 Broadcast preview #{bid}\nRecipients (eligible): {count}\nLabel: {label or "all"}\n\n{body[:500]}\n\nConfirm?',
         reply_markup=InlineKeyboardMarkup([[
             InlineKeyboardButton('Confirm',callback_data=f'bc:yes:{bid}'),
             InlineKeyboardButton('Cancel',callback_data=f'bc:no:{bid}')]]))
@@ -908,7 +906,7 @@ async def post_init(app):
             BotCommand('help','Show commands'),BotCommand('games','Choose a game'),
             BotCommand('support','Reach staff'),BotCommand('privacy','Privacy policy'),
             BotCommand('delete_data','Delete customer records'),
-            BotCommand('optin','Subscribe to optional updates'),BotCommand('optout','Stop optional updates')]
+            ]
     await app.bot.set_my_commands(public)
     commands=[BotCommand('profile','Customer profile'),BotCommand('id','Customer profile'),
               BotCommand('setaccount','Save game account'),BotCommand('delaccount','Remove game account'),
@@ -920,7 +918,7 @@ async def post_init(app):
               BotCommand('shortcuts','List saved replies'),BotCommand('close','Close topic'),
               BotCommand('stats','Statistics'),BotCommand('staff','Staff list'),
               BotCommand('block','Block customer'),BotCommand('unblock','Unblock customer'),
-              BotCommand('deposit','Staff: record a deposit'),BotCommand('broadcast','Staff: opt-in broadcast'),
+              BotCommand('deposit','Staff: record a deposit'),BotCommand('broadcast','Staff: customer broadcast'),
               BotCommand('health','Staff: queue health'),BotCommand('addstaff','Staff: add staff'),
               BotCommand('removestaff','Staff: remove staff'),
               BotCommand('addshortcut','Staff: create reply'),BotCommand('delshortcut','Staff: remove reply')]
@@ -955,7 +953,7 @@ def build_app(cfg=None,db=None):
     for command,handler in (
         ('start',customer_start),('help',help_command),('games',game_list),
         ('support',support),('privacy',privacy),('delete_data',delete_data),
-        ('optin',optin),('optout',optout)):
+        ('optout',optout)):
         app.add_handler(CommandHandler(command,handler,filters=private))
     app.add_handler(CallbackQueryHandler(customer_choice,pattern=r'^(game|bonus):'))
     app.add_handler(CallbackQueryHandler(delete_callback,pattern=r'^delete:(yes|no):\d+$'))
