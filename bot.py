@@ -314,6 +314,15 @@ async def recover_after_delivery(s,bot,uid):
             raise
 
 
+_OLD_BROADCAST_HEADER = '📢 WishWheel UPDATE\n\n'
+
+
+def clean_broadcast_body(body):
+    """Strip the old generated prefix from queued broadcasts only."""
+    content=body or ''
+    return content.removeprefix(_OLD_BROADCAST_HEADER)
+
+
 async def deliver_job(application, s, job):
     bot=application.bot
     uid=int(job['user_id'])
@@ -348,7 +357,8 @@ async def deliver_job(application, s, job):
         await bot.copy_message(chat_id=uid,from_chat_id=int(job['source_chat_id']),
                                message_id=int(job['source_message_id']))
     else:
-        await bot.send_message(chat_id=uid,text=job['body'])
+        text=clean_broadcast_body(job['body']) if direction=='broadcast' else job['body']
+        await bot.send_message(chat_id=uid,text=text)
     return True
 
 
@@ -371,7 +381,7 @@ async def mirror_one_broadcast(application,s):
     try:
         await application.bot.send_message(
             chat_id=s.cfg.group_id, message_thread_id=int(job['topic_id']),
-            text=('📢 BROADCAST SENT\n\n'+(job.get('body') or ''))[:4000])
+            text=('📢 BROADCAST SENT\n\n'+clean_broadcast_body(job.get('body')))[:4000])
     except RetryAfter as exc:
         await s.db.outbox_mirror_result(job_id,False,str(exc),max(1,int(exc.retry_after)+1))
     except Exception as exc:
